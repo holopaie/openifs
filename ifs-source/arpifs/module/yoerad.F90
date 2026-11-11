@@ -432,7 +432,9 @@ TYPE(TERAD), POINTER :: YRERAD => NULL()
 !                       2: HAM code for both SW and LW
 ! NCLOUDACT : INTEGER : Computation of effective radii (liq & ice)
 !                       0: IFS default parametrization
-!                       > 0: use Abdul-Razzak & Ghan activation scheme from HAMM7
+!                       1: Morales & Nenes activation scheme from HAMM7
+!                       2: Abdul-Razzak & Ghan activation scheme from HAMM7
+!                       3: Ghosh et al. (2025) activation scheme from HAMM7
 
 CONTAINS
 

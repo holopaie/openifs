@@ -178,7 +178,7 @@ USE MO_HAM,                  ONLY: nclass, naerocomp, sizeclass, nccndiag, subm_
 USE OIFS_TO_HAM,             ONLY: ind_oifs_ham
 USE MO_HAM_SUBM,             ONLY: HAM_SUBM_INTERFACE                   ! replaced HAM-M7 call with submodel interface
 USE MO_ACTIV,                ONLY: activ_updraft,nw, idt_cdnc, idt_icnc ! HAM-M7 activation updraft calculation, effective radii
-USE MO_HAM_ACTIV,            ONLY: ham_activ_abdulrazzak_ghan, ham_activ_koehler_ab ! HAM-M7 activation
+USE MO_HAM_ACTIV,            ONLY: ham_activ_abdulrazzak_ghan, ham_activ_koehler_ab, ham_activ_Ghosh ! HAM-M7 activation
 USE MO_PARAM_SWITCHES,       ONLY: ncd_activ        ! for activation
 USE MO_TRACDEF,              ONLY: ntrac, trlist    ! number of tracer for mass/number mixing ratio conversion, trlist for wet deposition flags
 USE MO_TRACER_PROCESSES,     ONLY: xt_borrow, xt_conv_massfix ! conserving the negative tracer values from tendency, and convective case
@@ -542,7 +542,7 @@ ASSOCIATE( &
          & RSIGAIR        => YRERAD%RSIGAIR,                       &
          & NRADFR         => YRERAD%NRADFR,                        & !FREQUENCY OF FULL RADIATION COMPUTATIONS
          & NAEROOPT       => YRERAD%NAEROOPT,                      &
-         & NCLOUDACT      => YRERAD%NCLOUDACT,                     & ! integer to switch activation scheme (0=default,1=Morales&Nenes, 2=Abdul-Razzak&Ghan)
+         & NCLOUDACT      => YRERAD%NCLOUDACT,                     & ! integer to switch activation scheme (0=default,1=Morales&Nenes, 2=Abdul-Razzak&Ghan, 3=Ghosh et al. 2025)
          & RCCNSEA        => YRERAD%RCCNSEA,                       & ! default ccn value over sea
          & RCCNLND        => YRERAD%RCCNLND,                       & ! default ccn value over land
          ! --- OTHERS ----------------------------------------------
@@ -1001,7 +1001,7 @@ ENDDO
          PGFL(KIDIA:KFDIA,1:KLEV,YRE_ICE%MP9_PH) = 1.0E-06_JPRB * REFFI(KIDIA:KFDIA,1:KLEV,ZKROW) ! convert um to meters
        ENDIF
        
-    ELSE IF (NCLOUDACT == 2) THEN ! AR&G scheme
+    ELSE IF (NCLOUDACT == 2 .OR. NCLOUDACT == 3) THEN ! AR&G scheme or Ghosh scheme
 
        !eehol: 1 if using the constant sigma_w it is set to 0.8, 2 to use Wnet derived sigma_w, 3 to use the TKE to calculate (the calculation here is inverted back to sigma_w in mo_activ.F90)
        IF ( NSIGW == 1 .OR. NSIGW == 2) THEN !eehol: use prescribed sigma_w or wnet derived to calculate TKE (inverse calculation in mo_activ)
@@ -1040,11 +1040,19 @@ ENDDO
 
        ZWPDF(KIDIA:KFDIA,1:KLEV,:) = MAX(ZWPDF(KIDIA:KFDIA,1:KLEV,:),1.0E-6_JPRB) !eehol: threshold vvel PDF to 1e-6 to get rid of 0 division
        
-       CALL HAM_ACTIV_ABDULRAZZAK_GHAN( KFDIA, KLON, KLEV, ZKROW, KTDIA,  & ! in original 1 = ktdia... for diagnostics so krow=1 and ktdia=1
-                                      & ZCDNCACT, ZESW, ZRHO,             & ! number of activated particles, saturation vapor pressure, air density
-                                      & ZXTP1, PTP, PRSF1, ZQP,           & ! tracer mix rat, temperature, air pressure, spec. humid.
-                                      & ZW, ZWPDF, ZA, ZB, ZRDRY,         & ! mean udr veloc, pdf of udr. veloc, Koehler A, Koehler B, dry radius
-                                      & ZNACT, ZFRACN, ZSC, ZRC, ZSMAX)     ! num. act. part. per mode, frac ", crit. ssat., crit. radius, max ssat
+       IF (NCLOUDACT == 2) THEN ! AR&G activation scheme
+         CALL HAM_ACTIV_ABDULRAZZAK_GHAN( KFDIA, KLON, KLEV, ZKROW, KTDIA,  & ! in original 1 = ktdia... for diagnostics so krow=1 and ktdia=1
+                                        & ZCDNCACT, ZESW, ZRHO,             & ! number of activated particles, saturation vapor pressure, air density
+                                        & ZXTP1, PTP, PRSF1, ZQP,           & ! tracer mix rat, temperature, air pressure, spec. humid.
+                                        & ZW, ZWPDF, ZA, ZB, ZRDRY,         & ! mean udr veloc, pdf of udr. veloc, Koehler A, Koehler B, dry radius
+                                        & ZNACT, ZFRACN, ZSC, ZRC, ZSMAX)     ! num. act. part. per mode, frac ", crit. ssat., crit. radius, max ssat
+       ELSE IF (NCLOUDACT == 3) THEN ! Ghosh et al. (2025) activation scheme
+         CALL HAM_ACTIV_GHOSH( KFDIA, KLON, KLEV, ZKROW, KTDIA,             & ! in original 1 = ktdia... for diagnostics so krow=1 and ktdia=1
+                                        & ZCDNCACT, ZESW, ZRHO,             & ! number of activated particles, saturation vapor pressure, air density
+                                        & ZXTP1, PTP, PRSF1, ZQP,           & ! tracer mix rat, temperature, air pressure, spec. humid.
+                                        & ZW, ZWPDF, ZA, ZB, ZRDRY,         & ! mean udr veloc, pdf of udr. veloc, Koehler A, Koehler B, dry radius
+                                        & ZNACT, ZFRACN, ZSC, ZRC, ZSMAX)     ! num. act. part. per mode, frac ", crit. ssat., crit. radius, max ssat
+       END IF
 
        ! threshold fraction of activated particles to gridcells with only liquid clouds
        DO JCLASS = 1,NCLASS
@@ -1123,7 +1131,7 @@ ENDDO
     
     !-----------------------------------------------------------------
     !--> Calculation of liquid effective radii (Note: already done if NCLOUDACT=1)
-    IF (NCLOUDACT == 2 .OR. NCLOUDACT == 0 ) THEN
+    IF (NCLOUDACT == 0 .OR. NCLOUDACT == 2 .OR. NCLOUDACT == 3) THEN
 
       DO JK=1,KLEV
         DO JL=KIDIA,KFDIA

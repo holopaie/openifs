@@ -56,7 +56,7 @@ MODULE mo_ham_activ
 
   IMPLICIT NONE
 
-  PUBLIC ham_activ_abdulrazzak_ghan
+  PUBLIC ham_activ_abdulrazzak_ghan, ham_activ_Ghosh
 !-->HK: diagnostics streams to be only used with HAMMOZ
 #ifdef HAMMOZ
   ham_activ_diag_abdulrazzak_ghan_strat, ham_activ_diag_abdulrazzak_ghan_conv
@@ -399,6 +399,372 @@ CONTAINS
     END DO
 
   END SUBROUTINE ham_activ_abdulrazzak_ghan
+
+  SUBROUTINE ham_activ_Ghosh(kproma,   kbdim,   klev,  krow,  ktdia, &
+                                        pcdncact, pesw,    prho,                &
+                                        pxtm1,    ptm1,    papm1, pqm1,         &
+                                        pw,       pwpdf,   pa,    pb,           &
+                                        prdry,    pnact,   pfracn,              &
+                                        psc,      prc,     psmax  )
+
+
+    ! *ham_activ_Ghosh* calculates the number of activated aerosol
+    !              particles from the aerosol size-distribution,
+    !              composition and ambient supersaturation
+    !
+    ! Author:
+    ! -------
+    ! Philip Stier, MPI-MET, Caltech, University of Oxford  2002-2009
+    !
+    ! Method:
+    ! -------
+    ! The calculation of the activation can be reduced to 4 tasks:
+    !
+    ! 0)   Calculation of Koehler A/B coefficients
+    !      (now done in ham_activ_koehler_ab)
+    ! I)   Calculate the maximum supersaturation
+    ! II)  Calculate the corresponding radius of activation
+    !      for each mode
+    ! III) Calculate the number of particles that are larger
+    !      then the radius of activation for each mode.
+    !
+    ! III) Calculation of the number of activated particles:
+    !      See the routine ham_m7_logtail below.
+    !
+    ! The calculations are now performed separately for
+    ! stratiform and convective updraft velocities.
+    !
+    ! References:
+    ! -----------
+    ! Abdul-Razzak et al., JGR, 103, D6, 6123-6131, 1998.
+    ! Abdul-Razzak and Ghan, JGR, 105, D5, 6837-6844, 2000.
+    ! Pruppbacher and Klett, Kluewer Ac. Pub., 1997.
+
+    !>>dod soa
+    ! ***
+    ! jamie - use sigma instead of ln(sigma) for Ghosh scheme
+    USE mo_ham_m7ctl,   ONLY: sigmaln, sigma, &
+                              inucs,  iaits,  iaccs,  icoas,   &
+                              iaiti,  iacci,  icoai,           &
+                              iso4ns, iso4ks, iso4as, iso4cs,  &
+                              ibcks,  ibcas,  ibccs,  ibcki,   &
+                              iocks,  iocas,  ioccs,  iocki,   &
+                              issas,  isscs,                   &
+                              iduas,  iducs,  iduai,  iduci
+    ! ***
+    !<<dod
+    USE mo_ham_tools,   ONLY: ham_m7_logtail
+    USE mo_tracdef,     ONLY: trlist, ntrac, AEROSOLMASS
+    USE mo_ham,         ONLY: naerocomp, aerocomp, sizeclass, nclass, HAM_M7, naeroclass
+    USE mo_math_constants,     ONLY: pi
+    USE mo_physical_constants, ONLY: rhoh2o, argas, rv, cpd, grav, alv, amw, amd, tmelt
+    !USE mo_echam_cloud_params, ONLY: cthomi ! minimum T for mixed clouds !eehol: this is not needed to be from echam
+    !>>SF
+    USE mo_conv,        ONLY: cdncact_cv
+    !<<SF
+    !>>DN #364
+#ifdef HAMMOZ
+    USE mo_ham_streams,  ONLY: frac
+    USE mo_activ,        ONLY: na
+#endif
+    USE mo_activ,        ONLY: nw
+    !<<DN #364
+
+    IMPLICIT NONE
+
+    !--- Arguments:
+
+    INTEGER, INTENT(in)   :: kproma, kbdim, klev, krow, ktdia
+
+    REAL(dp), INTENT(out) :: pcdncact(kbdim,klev),       & ! number of activated particles
+                             pnact(kbdim,klev,nclass),   & ! number of activated particles per mode [m-3]
+                             pfracn(kbdim,klev,nclass),  & ! fraction of activated particles per mode
+                             psc(kbdim,klev,nclass),     & ! critical supersaturation [% 0-1]
+                             prc(kbdim,klev,nclass,nw),  & ! critical radius of activation per mode [m]
+                             psmax(kbdim,klev,nw)          ! maximum supersaturation [% 0-1]
+    !REAL(dp), INTENT(out) :: pfrac_m7(kbdim,klev,nclass), pna_m7(kbdim,klev,nclass)
+
+    REAL(dp), INTENT(in)  :: ptm1(kbdim,klev),           & ! temperature
+                             papm1(kbdim,klev),          & ! pressure
+                             prho(kbdim,klev),           & ! air density
+                             pqm1(kbdim,klev),           & ! specific humidity
+                             pesw(kbdim,klev),           & ! saturation water vapour pressure
+                             pw(kbdim,klev,nw),          & ! mean or bins of updraft velocity (>0.0) [m s-1]
+                             pwpdf(kbdim,klev,nw),       & ! PDF of updraft velocity [s m-1]
+                             pxtm1(kbdim,klev,ntrac),    &
+                             pa(kbdim,klev,nclass),      & ! curvature parameter A of the Koehler equation
+                             pb(kbdim,klev,nclass),      & ! hygroscopicity parameter B of the Koehler equation
+                             prdry(kbdim,klev,nclass)      ! dry radius for each mode
+
+    !--- Local variables:
+
+    INTEGER :: jclass,      jk,            &
+               jt,          jl,            &
+               jw
+
+    REAL(dp):: zkv,                        &
+               zeps,      zalpha,          &
+               zgamma,                     &
+               zgrowth,                    &
+               zdif,      zxv,             &
+               zk,        zka
+
+    REAL(dp):: zamw,                       & ! molecular weight of water [kg mol-1]
+               zamd                          ! molecular weight of dry air [kg mol-1]
+
+    REAL(dp):: zf(nclass), zg(nclass)
+
+    REAL(dp):: zfracn(kbdim,klev)            ! fraction of activated aerosol numbers for current mode and w bin
+
+    REAL(dp):: zfracn_top(kbdim,klev,nclass), & ! w * dw weighted activated aerosol fraction
+               zfracn_bot(kbdim,klev,nclass)    ! weighting factor  (sum of w * dw)
+
+    REAL(dp):: zn(kbdim,klev,nclass),      & ! aerosol number concentration for each mode [m-3]
+               zsm(kbdim,klev,nclass)        ! critical supersaturation for activating particles
+                                             !    with the mode number median radius
+
+    REAL(dp) :: zeta(nw), zxi(nw), zsum(nw)
+
+    REAL(dp), PARAMETER :: zsten = 75.0E-3_dp ! surface tension of H2O [J m-2]
+                                              !   neglecting salts and temperature
+                                               !   (also tried P&K 5.12 - erroneous!)
+
+    LOGICAL, PARAMETER :: ll_numb = .TRUE.  ! switch between number/mass in logtail calculation !SF
+
+    ! ***
+    ! jamie - adding new p tuning parameter
+    REAL(dp) :: p_factor(nw)
+    ! ***
+
+
+    !--- 0) Initializations:
+
+    zsm(1:kproma,:,:)        = 0._dp
+    zfracn_top(1:kproma,:,:) = 0._dp
+    zfracn_bot(1:kproma,:,:) = 0._dp
+    prc(1:kproma,:,:,:)      = 1._dp ! [m] initialized with 1m, only changed if activation occurs
+    pnact(1:kproma,:,:)      = 0._dp
+    pfracn(1:kproma,:,:)     = 0._dp
+    pcdncact(1:kproma,:)     = 0._dp
+
+    zeps=THRESHOLD !EPSILON(1._dp)
+
+    !--- Conversions to SI units [g mol-1 to kg mol-1]:
+
+    zamw=amw*1.E-3_dp
+    zamd=amd*1.E-3_dp
+
+    !--- Number per unit volume for each mode:
+    DO jclass=1, nclass
+       jt = sizeclass(jclass)%idt_no
+       !>>dod #377
+       IF (sizeclass(jclass)%lactivation) THEN
+          zn(1:kproma,:,jclass)=pxtm1(1:kproma,:,jt)*prho(1:kproma,:)
+       END IF
+       !<<dod
+    END DO
+
+    ! ***
+    ! jamie - updating f and g tuning parameters to match Ghosh et al.
+    ! https://doi.org/10.5194/gmd-18-4899-2025
+    ! (7):
+    !zf(:)=0.5_dp*EXP(2.5_dp*sigmaln(:)**2._dp)
+    zf(:)=0.0135_dp*EXP(2.367_dp*sigma(iaccs))
+    ! (8):
+    !zg(:)=1._dp+0.25_dp*sigmaln(:)
+    zg(:)=1.1058_dp-0.315_dp*sigma(iaccs)
+    ! ***
+
+    !--- 1) Calculation of Koehler A/B coefficients:
+    !       Now done in ham_activ_koehler_ab once so that they can be used in
+    !       convective and stratiform activation
+
+    !--- 2) Calculate maximum supersaturation:
+
+    !--- 2.1) Abbdul-Razzak and Ghan (2000):
+    !         (Equations numbers from this paper unless otherwise quoted)
+
+    DO jk=ktdia, klev
+       DO jl=1, kproma
+
+          !--- Water vapour pressure:
+
+          IF( (nw>1 .OR. pw(jl,jk,1)>zeps) .AND. &
+              pqm1(jl,jk)>zeps             .AND. &
+              ptm1(jl,jk)>(tmelt-35.0_dp)  ) THEN  !eehol: temp greater than homogenic ice nucleation temperature
+
+             !--- Abdul-Razzak et al. (1998) (Eq. 11):
+
+             zalpha=(grav*zamw*alv)/(cpd*argas*ptm1(jl,jk)**2) - &
+                    (grav*zamd)/(argas*ptm1(jl,jk))
+
+             zgamma=(argas*ptm1(jl,jk))/(pesw(jl,jk)*zamw) +  &
+                    (zamw*alv**2)/(cpd*papm1(jl,jk)*zamd*ptm1(jl,jk))
+
+             !--- Diffusivity of water vapour in air (P&K, 13.3) [m2 s-1]:
+
+             zdif=0.211_dp * (ptm1(jl,jk)/tmelt)**1.94_dp * (101325._dp/papm1(jl,jk)) *1.E-4_dp
+
+             !--- Thermal conductivity zk (P&K, 13.18) [cal cm-1 s-1 K-1]:
+
+             ! Mole fraction of water:
+
+             zxv=pqm1(jl,jk)*(zamd/zamw)
+
+             zka=(5.69_dp+0.017_dp*(ptm1(jl,jk)-273.15_dp))*1.E-5_dp
+
+             zkv=(3.78_dp+0.020_dp*(ptm1(jl,jk)-273.15_dp))*1.E-5_dp
+
+             ! Moist air, convert to [J m-1 s-1 K-1]:
+
+             zk =zka*(1._dp-(1.17_dp-1.02_dp*zkv/zka)*zxv) * 4.1868_dp*1.E2_dp
+
+             !--- Abdul-Razzak et al. (1998) (Eq. 16):
+
+             zgrowth=1._dp/                                                   &
+                       ( (rhoh2o*argas*ptm1(jl,jk))/(pesw(jl,jk)*zdif*zamw) + &
+                       (alv*rhoh2o)/(zk*ptm1(jl,jk)) * ((alv*zamw)/(ptm1(jl,jk)*argas) -1._dp) )
+
+             !--- Summation for equation (6):
+
+             zsum(:)=0._dp
+
+             DO jclass=1, nclass
+                !>>dod #377
+                IF (sizeclass(jclass)%lactivation) THEN
+                   IF (zn(jl,jk,jclass)    > zeps     .AND. &
+                        prdry(jl,jk,jclass) > 1.E-9_dp .AND. &
+                        pa(jl,jk,jclass)    > zeps     .AND. &
+                        pb(jl,jk,jclass)    > zeps           ) THEN
+
+                      ! (9):
+
+                      zsm(jl,jk,jclass)=2._dp/SQRT(pb(jl,jk,jclass)) * &
+                                   (pa(jl,jk,jclass)/(3._dp*prdry(jl,jk,jclass)))**1.5_dp
+
+                      ! (10):
+
+                      zxi(:)=2._dp*pa(jl,jk,jclass)/3._dp * SQRT(zalpha*pw(jl,jk,:)/zgrowth)
+
+                      ! (11):
+
+                      zeta(:)=((zalpha*pw(jl,jk,:)/zgrowth)**1.5_dp) / &
+                             (2._dp*pi*rhoh2o*zgamma*zn(jl,jk,jclass))
+
+                      ! ***
+                      ! jamie - compute new p term, based on conditionals
+                      DO jw=1, nw
+                         IF ((zxi(jw)/zeta(jw)) .gt. 1._dp) THEN
+                            p_factor(jw) = -0.5073_dp+1.5088_dp*sigma(iaccs)-(0.3699_dp*(sigma(iaccs))**2._dp)
+                            ! ^ Set to index 3 for soluble accumulation mode geometric standard deviation
+                            ! care needed here if index of soluble accumulation mode changes
+                         ELSEIF ((zxi(jw)/zeta(jw)) .le. 1._dp) THEN
+                            p_factor(jw) = 1.5_dp
+                         ENDIF
+                      END DO
+                      ! ***
+
+                      ! (6):
+
+                      WHERE (pw(jl,jk,:)>zeps)
+                         ! ***
+                         ! jamie - replace constant 1.5_dp with new p tuning parameter
+                         !zsum(:)=zsum(:) + ( 1._dp/zsm(jl,jk,jclass)**2                  &
+                         !                 * ( zf(jclass)*(zxi(:)/zeta(:))**1.5_dp     &
+                         !                     + zg(jclass)*( zsm(jl,jk,jclass)**2._dp &
+                         !                                    / (zeta(:)+3._dp*zxi(:)) )**0.75_dp ) )
+                         zsum(:)=zsum(:) + ( 1._dp/zsm(jl,jk,jclass)**2                  &
+                                          * ( zf(jclass)*(zxi(:)/zeta(:))**p_factor(:)     &
+                                              + zg(jclass)*( zsm(jl,jk,jclass)**2._dp &
+                                                             / (zeta(:)+3._dp*zxi(:)) )**0.75_dp ) )
+                         ! ***
+                      END WHERE
+
+                   ENDIF
+                END IF
+                !<<dod
+             END DO ! jclass
+
+             WHERE (zsum(:) > zeps)
+                psmax(jl,jk,:)=1._dp/SQRT(zsum(:))
+             ELSEWHERE
+                psmax(jl,jk,:)=0._dp
+             END WHERE
+
+          ELSE
+             psmax(jl,jk,:)=0._dp
+          END IF
+
+       END DO ! jl
+    END DO ! jk
+
+    !--- Diagnostics:
+    DO jclass=1, nclass
+       !>>dod #377
+       IF (sizeclass(jclass)%lactivation) THEN
+          psc(1:kproma,:,jclass) = zsm(1:kproma,:,jclass)
+       END IF
+       !<<dod
+    END DO
+
+    !--- 3) Calculate activation:
+
+    DO jw=1, nw
+       DO jclass=1, nclass
+
+          IF (sizeclass(jclass)%lactivation) THEN !>>dod<< #377
+
+             WHERE (psmax(1:kproma,ktdia:klev,jw)>zeps      .AND. &
+                    zsm(1:kproma,ktdia:klev,jclass)>zeps    .AND. &
+                    zn(1:kproma,ktdia:klev,jclass)>zeps     .AND. &
+                    prdry(1:kproma,ktdia:klev,jclass)>1.E-9_dp       )
+
+                prc(1:kproma,ktdia:klev,jclass,jw)                            &
+                    = prdry(1:kproma,ktdia:klev,jclass)                       &
+                        * ( zsm(1:kproma,ktdia:klev,jclass)                   &
+                            / psmax(1:kproma,ktdia:klev,jw) )**(2._dp/3._dp)
+
+             END WHERE
+
+             !--- 3.2) Calculate the fractional number of each mode
+             !         larger than the mode critical radius:
+             CALL ham_m7_logtail(kproma,    kbdim,  klev,   krow, jclass, &
+                                 ll_numb,   prdry(:,:,jclass),            &
+                                 prc(:,:,jclass,jw), zfracn(:,:))
+
+             !--- 3.3) Sum up the total number of activated particles, integrating over updraft PDF [m-3]:
+             ! The weighting here should be correct (up to discretisation error)
+             ! provided that the w bins are equally spaced and cover the whole
+             ! range of integration.
+             zfracn_top(1:kproma,:,jclass) = zfracn_top(1:kproma,:,jclass) &
+                                           + zfracn(1:kproma,:)*pwpdf(1:kproma,:,jw)
+             zfracn_bot(1:kproma,:,jclass) = zfracn_bot(1:kproma,:,jclass) &
+                                           + pwpdf(1:kproma,:,jw)
+
+          END IF ! lactivation !>>dod<<
+
+       END DO ! jclass
+    END DO ! jw
+
+    !-->HK
+    !IF (.NOT. ALLOCATED(pfrac_m7)) ALLOCATE(pfrac_m7(kbdim,klev,nclass))
+    !IF (.NOT. ALLOCATED(pna_m7)) ALLOCATE(pna_m7(kbdim,klev,nclass))
+    !<--HK
+
+    DO jclass=1, nclass
+       IF (sizeclass(jclass)%lactivation) THEN !>>dod<< #377
+          pfracn(1:kproma,:,jclass) = zfracn_top(1:kproma,:,jclass)/zfracn_bot(1:kproma,:,jclass)
+          pnact(1:kproma,:,jclass)  = pfracn(1:kproma,:,jclass) * zn(1:kproma,:,jclass)
+          pcdncact(1:kproma,:)      = pcdncact(1:kproma,:) + pnact(1:kproma,:,jclass)
+          !-->HK
+          !pfrac_m7(1:kproma,:,jclass) = pfracn(1:kproma,:,jclass)
+          !pna_m7(1:kproma,:,jclass)   = pnact(1:kproma,:,jclass)
+          !<--HK
+       END IF
+    END DO
+
+  END SUBROUTINE ham_activ_Ghosh
+
 
 !-->HK: diagnostics streams to be only used with HAMMOZ
 #ifdef HAMMOZ
